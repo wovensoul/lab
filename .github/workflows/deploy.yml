@@ -1,0 +1,36 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Each folder is its own Cloudflare Pages project with the same name.
+        app: [automata, shape-art]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Fails harmlessly once the project exists.
+      - name: Create Pages project
+        continue-on-error: true
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages project create ${{ matrix.app }} --production-branch=main
+
+      # Pushes to main go to production; pull requests get a preview URL for their branch.
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy ${{ matrix.app }} --project-name=${{ matrix.app }} --branch=${{ github.head_ref || github.ref_name }}

@@ -1,0 +1,346 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shape Art</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font: 14px system-ui, sans-serif; min-height: 100vh; display: flex; flex-direction: column; }
+  #bar { display: flex; gap: 14px; align-items: center; padding: 10px 12px; flex-wrap: wrap; background: #1b1b1b; border-bottom: 1px solid #333; }
+  button { background: #2a2a2a; color: #ddd; border: 1px solid #444; padding: 5px 12px; border-radius: 4px; cursor: pointer; }
+  button:hover { background: #333; }
+  button.primary { background: #2d4a1e; border-color: #4f7a35; }
+  label { display: flex; align-items: center; gap: 6px; }
+  input[type=number] { width: 64px; background: #222; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 3px 5px; }
+  #stats { margin-left: auto; opacity: .7; font-variant-numeric: tabular-nums; }
+  #main { flex: 1; display: flex; gap: 20px; padding: 20px; align-items: flex-start; justify-content: center; flex-wrap: wrap; }
+  .panel { display: flex; flex-direction: column; gap: 6px; align-items: center; }
+  .panel span { font-size: 12px; opacity: .6; }
+  canvas { background: #1a1a1a; border-radius: 4px; display: block; max-width: calc(100vw - 40px); height: auto !important; }
+  #stats.error { color: #f77; opacity: 1; }
+  @media (max-width: 700px) {
+    #bar { gap: 8px; }
+    #stats { margin-left: 0; width: 100%; }
+    #main { padding: 12px; }
+    #empty { padding: 40px 20px; }
+  }
+  #drop { position: fixed; inset: 0; background: rgba(40, 70, 30, .85); display: none; align-items: center; justify-content: center; font-size: 28px; z-index: 10; pointer-events: none; }
+  body.dragging #drop { display: flex; }
+  #empty { border: 2px dashed #444; border-radius: 8px; padding: 60px 80px; text-align: center; cursor: pointer; line-height: 1.8; }
+  #empty:hover { border-color: #4f7a35; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <button class="primary" id="pick">Upload image</button>
+  <input type="file" id="file" accept="image/*" hidden>
+  <button id="regen">Regenerate</button>
+  <button id="stop">Stop</button>
+  <button id="svg">Download SVG</button>
+  <label>Shapes <input type="number" id="shapes" value="700" min="1" max="10000"></label>
+  <label title="Stop early once the match reaches this percentage. Leave empty to always use the full shape count.">Stop at % match <input type="number" id="goal" value="98" placeholder="off" min="50" max="100" step="0.1"></label>
+  <label>Opacity <input type="range" id="alpha" min="0.1" max="1" step="0.05" value="0.5"><span id="alphaV">0.50</span></label>
+  <label>Random shapes / step <input type="number" id="cands" value="300" min="1" max="5000"></label>
+  <label>Mutations / step <input type="number" id="age" value="100" min="0" max="2000"></label>
+  <label>Work size <input type="number" id="res" value="256" min="64" max="512" step="32"></label>
+  <span id="stats"></span>
+</div>
+<div id="main">
+  <div id="empty">Drop an image here, click to choose one,<br>or paste one with Ctrl+V</div>
+  <div class="panel" id="origPanel" hidden><canvas id="orig"></canvas><span>Original (working copy)</span></div>
+  <div class="panel" id="outPanel" hidden><canvas id="out"></canvas><span id="outLabel">Triangles</span></div>
+</div>
+<div id="drop">Drop image to load it</div>
+
+<script id="workerSrc" type="text/js-worker">
+// Each worker keeps its own copy of the canvas; the main thread broadcasts every committed
+// shape so all copies stay identical, and each worker searches its share of the candidates.
+let W, H, target, current, alpha;
+const span = new Int32Array(3 * 1024);
+let spanN = 0;
+
+function rasterize(p) {
+  const [x0, y0, x1, y1, x2, y2] = p;
+  const ys = Math.max(0, Math.ceil(Math.min(y0, y1, y2) - 0.5));
+  const ye = Math.min(H - 1, Math.floor(Math.max(y0, y1, y2) - 0.5));
+  spanN = 0;
+  for (let y = ys; y <= ye; y++) {
+    const yc = y + 0.5;
+    let lo = Infinity, hi = -Infinity, x;
+    if ((y0 <= yc) !== (y1 <= yc)) { x = x0 + (yc - y0) / (y1 - y0) * (x1 - x0); if (x < lo) lo = x; if (x > hi) hi = x; }
+    if ((y1 <= yc) !== (y2 <= yc)) { x = x1 + (yc - y1) / (y2 - y1) * (x2 - x1); if (x < lo) lo = x; if (x > hi) hi = x; }
+    if ((y2 <= yc) !== (y0 <= yc)) { x = x2 + (yc - y2) / (y0 - y2) * (x0 - x2); if (x < lo) lo = x; if (x > hi) hi = x; }
+    const xa = Math.max(0, Math.ceil(lo - 0.5)), xb = Math.min(W - 1, Math.floor(hi - 0.5));
+    if (xa <= xb) { span[spanN++] = y; span[spanN++] = xa; span[spanN++] = xb; }
+  }
+  return spanN;
+}
+
+// Best color for the shape, then how much the total squared error would change if drawn.
+function evaluate(p) {
+  if (!rasterize(p)) return null;
+  let r = 0, g = 0, b = 0, cnt = 0;
+  const ia = 1 / alpha;
+  for (let s = 0; s < spanN; s += 3) {
+    const row = span[s] * W;
+    for (let x = span[s + 1]; x <= span[s + 2]; x++) {
+      const i = (row + x) * 3;
+      r += (target[i] - current[i]) * ia + current[i];
+      g += (target[i + 1] - current[i + 1]) * ia + current[i + 1];
+      b += (target[i + 2] - current[i + 2]) * ia + current[i + 2];
+      cnt++;
+    }
+  }
+  const cl = v => Math.max(0, Math.min(255, Math.round(v / cnt)));
+  const cr = cl(r), cg = cl(g), cb = cl(b);
+  let d = 0;
+  for (let s = 0; s < spanN; s += 3) {
+    const row = span[s] * W;
+    for (let x = span[s + 1]; x <= span[s + 2]; x++) {
+      const i = (row + x) * 3;
+      for (let c = 0; c < 3; c++) {
+        const cur = current[i + c], t = target[i + c], col = c === 0 ? cr : c === 1 ? cg : cb;
+        const nv = cur + (col - cur) * alpha;
+        d += (t - nv) * (t - nv) - (t - cur) * (t - cur);
+      }
+    }
+  }
+  return { delta: d, color: [cr, cg, cb] };
+}
+
+function angleAt(ax, ay, bx, by, cx, cy) {
+  const ux = bx - ax, uy = by - ay, vx = cx - ax, vy = cy - ay;
+  const m = Math.hypot(ux, uy) * Math.hypot(vx, vy);
+  return m ? Math.acos(Math.max(-1, Math.min(1, (ux * vx + uy * vy) / m))) * 57.2958 : 0;
+}
+// Reject slivers: every corner must be at least 15 degrees.
+function valid(p) {
+  return angleAt(p[0], p[1], p[2], p[3], p[4], p[5]) > 15 &&
+         angleAt(p[2], p[3], p[4], p[5], p[0], p[1]) > 15 &&
+         angleAt(p[4], p[5], p[0], p[1], p[2], p[3]) > 15;
+}
+
+function randomTriangle() {
+  for (;;) {
+    const x = Math.random() * W, y = Math.random() * H, R = 8 + Math.random() * Math.max(W, H) * 0.25;
+    const p = [x, y, x + (Math.random() * 2 - 1) * R, y + (Math.random() * 2 - 1) * R, x + (Math.random() * 2 - 1) * R, y + (Math.random() * 2 - 1) * R];
+    if (valid(p)) return p;
+  }
+}
+const gauss = () => Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random());
+function mutate(p) {
+  for (;;) {
+    const q = p.slice(), k = (Math.random() * 3 | 0) * 2;
+    q[k] = Math.max(-16, Math.min(W + 16, q[k] + gauss() * 16));
+    q[k + 1] = Math.max(-16, Math.min(H + 16, q[k + 1] + gauss() * 16));
+    if (valid(q)) return q;
+  }
+}
+
+function search(n, maxAge) {
+  let best = null;
+  for (let i = 0; i < n; i++) {
+    const p = randomTriangle(), r = evaluate(p);
+    if (r && (!best || r.delta < best.delta)) best = { pts: p, ...r };
+  }
+  if (!best) return null;
+  // Hill climb: keep tweaks that help, stop after maxAge failures in a row.
+  for (let fails = 0; fails < maxAge;) {
+    const q = mutate(best.pts), r = evaluate(q);
+    if (r && r.delta < best.delta) { best = { pts: q, ...r }; fails = 0; } else fails++;
+  }
+  return best;
+}
+
+function commit(p, color) {
+  rasterize(p);
+  for (let s = 0; s < spanN; s += 3) {
+    const row = span[s] * W;
+    for (let x = span[s + 1]; x <= span[s + 2]; x++) {
+      const i = (row + x) * 3;
+      for (let c = 0; c < 3; c++) current[i + c] += (color[c] - current[i + c]) * alpha;
+    }
+  }
+}
+
+onmessage = ({ data: m }) => {
+  if (m.type === 'init') {
+    W = m.w; H = m.h; alpha = m.alpha; target = m.target;
+    current = new Float32Array(W * H * 3);
+    for (let i = 0; i < current.length; i += 3) current.set(m.bg, i);
+  } else if (m.type === 'step') {
+    let err = 0;
+    for (let i = 0; i < current.length; i++) { const d = target[i] - current[i]; err += d * d; }
+    postMessage({ best: search(m.n, m.age), err });
+  } else if (m.type === 'commit') {
+    commit(m.pts, m.color);
+  }
+};
+</script>
+
+<script>
+const $ = id => document.getElementById(id);
+const workerURL = URL.createObjectURL(new Blob([$('workerSrc').textContent], { type: 'text/javascript' }));
+const NUM_WORKERS = Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 4) - 1));
+
+let source = null;   // decoded full-size image
+let work = null;     // { w, h, target: Float32Array, bg: [r,g,b] }
+let shapes = [], workers = [], runId = 0, bg = [0, 0, 0], alpha = 0.5, total = 0;
+const DISPLAY = 560;
+
+// ---------- loading & downscaling ----------
+function showError(msg) {
+  $('stats').textContent = 'Error: ' + msg;
+  $('stats').classList.add('error');
+}
+addEventListener('error', e => showError(e.message));
+addEventListener('unhandledrejection', e => showError(e.reason && e.reason.message || String(e.reason)));
+
+function decodeWithImgTag(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image(), url = URL.createObjectURL(file);
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("couldn't decode image")); };
+    img.src = url;
+  });
+}
+
+async function loadFile(file) {
+  // Some phone pickers report an empty type, so only reject files that are clearly not images.
+  if (!file || (file.type && !file.type.startsWith('image/'))) return;
+  $('stats').classList.remove('error');
+  $('stats').textContent = 'Loading image…';
+  let img = null;
+  try { img = await createImageBitmap(file); } catch {}
+  if (!img) {
+    try { img = await decodeWithImgTag(file); } catch {
+      showError(`your browser can't decode this file (${file.type || 'unknown type'}). Try a JPG or PNG.`);
+      return;
+    }
+  }
+  source = img;
+  prepare();
+  regenerate();
+}
+
+function prepare() {
+  const res = Math.max(64, Math.min(512, +$('res').value || 256));
+  const s = Math.min(1, res / Math.max(source.width, source.height));
+  const w = Math.max(1, Math.round(source.width * s)), h = Math.max(1, Math.round(source.height * s));
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const cx = c.getContext('2d', { willReadFrequently: true });
+  cx.fillStyle = '#fff'; cx.fillRect(0, 0, w, h); // flatten transparent images onto white
+  cx.imageSmoothingQuality = 'high';
+  cx.drawImage(source, 0, 0, w, h);
+  const px = cx.getImageData(0, 0, w, h).data;
+  const target = new Float32Array(w * h * 3);
+  const sum = [0, 0, 0];
+  for (let i = 0, j = 0; i < px.length; i += 4, j += 3) {
+    for (let k = 0; k < 3; k++) { target[j + k] = px[i + k]; sum[k] += px[i + k]; }
+  }
+  work = { w, h, target, bg: sum.map(v => Math.round(v / (w * h))) };
+
+  const scale = DISPLAY / Math.max(w, h), dpr = window.devicePixelRatio || 1;
+  for (const id of ['orig', 'out']) {
+    const cv = $(id);
+    cv.width = Math.round(w * scale * dpr); cv.height = Math.round(h * scale * dpr);
+    cv.style.width = Math.round(w * scale) + 'px'; cv.style.height = Math.round(h * scale) + 'px';
+  }
+  const o = $('orig').getContext('2d');
+  o.imageSmoothingEnabled = false;
+  o.drawImage(c, 0, 0, $('orig').width, $('orig').height);
+  $('empty').hidden = true; $('origPanel').hidden = false; $('outPanel').hidden = false;
+}
+
+// ---------- running ----------
+function stopWorkers() { workers.forEach(w => w.terminate()); workers = []; }
+
+async function regenerate() {
+  if (!work) { showError('no image loaded yet. Upload one first.'); return; }
+  $('stats').classList.remove('error');
+  const id = ++runId;
+  stopWorkers();
+  alpha = +$('alpha').value;
+  bg = work.bg; shapes = [];
+  total = 0;
+  for (let i = 0; i < work.target.length; i += 3)
+    for (let k = 0; k < 3; k++) { const d = work.target[i + k] - bg[k]; total += d * d; }
+  workers = Array.from({ length: NUM_WORKERS }, () => {
+    const w = new Worker(workerURL);
+    w.onerror = e => showError('worker failed: ' + (e.message || 'unknown error'));
+    w.postMessage({ type: 'init', w: work.w, h: work.h, alpha, target: work.target, bg });
+    return w;
+  });
+  const out = $('out').getContext('2d'), sc = $('out').width / work.w;
+  out.setTransform(sc, 0, 0, sc, 0, 0);
+  out.fillStyle = `rgb(${bg})`; out.fillRect(0, 0, work.w, work.h);
+
+  const maxShapes = +$('shapes').value || 700;
+  const perWorker = Math.max(1, Math.ceil((+$('cands').value || 300) / NUM_WORKERS));
+  const age = Math.max(0, +$('age').value || 0);
+  const goal = +$('goal').value || 0;
+  const t0 = performance.now();
+  let reached = false;
+  $('stats').textContent = `0 / ${maxShapes} shapes · ${(100 * (1 - Math.sqrt(total / work.target.length) / 255)).toFixed(1)}% match`;
+
+  while (shapes.length < maxShapes && id === runId) {
+    const results = await Promise.all(workers.map(w => new Promise(res => {
+      w.onmessage = e => res(e.data);
+      w.postMessage({ type: 'step', n: perWorker, age });
+    })));
+    if (id !== runId) return;
+    const best = results.map(r => r.best).filter(Boolean).sort((a, b) => a.delta - b.delta)[0];
+    if (!best) break;
+    if (best.delta >= 0) break; // nothing improves the picture anymore
+    workers.forEach(w => w.postMessage({ type: 'commit', pts: best.pts, color: best.color }));
+    shapes.push(best);
+    total = Math.max(0, results[0].err + best.delta);
+    drawShape(out, best);
+    const sim = 100 * (1 - Math.sqrt(total / work.target.length) / 255);
+    $('stats').textContent = `${shapes.length} / ${maxShapes} shapes · ${sim.toFixed(1)}% match${goal ? ` (goal ${goal}%)` : ''} · ${((performance.now() - t0) / 1000).toFixed(1)}s · ${NUM_WORKERS} threads`;
+    if (goal && sim >= goal) { reached = true; break; }
+  }
+  if (id === runId) { stopWorkers(); $('stats').textContent += reached ? ' · reached goal' : ' · done'; }
+}
+
+function drawShape(ctx, s) {
+  const p = s.pts;
+  ctx.fillStyle = `rgba(${s.color},${alpha})`;
+  ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(p[2], p[3]); ctx.lineTo(p[4], p[5]); ctx.closePath(); ctx.fill();
+}
+
+function downloadSVG() {
+  if (!work || !shapes.length) return;
+  const f = v => +v.toFixed(1);
+  const body = shapes.map(s => `<polygon points="${f(s.pts[0])},${f(s.pts[1])} ${f(s.pts[2])},${f(s.pts[3])} ${f(s.pts[4])},${f(s.pts[5])}" fill="rgb(${s.color})"/>`).join('\n');
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${work.w} ${work.h}">\n<rect width="100%" height="100%" fill="rgb(${bg})"/>\n<g fill-opacity="${alpha}">\n${body}\n</g>\n</svg>\n`;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
+  a.download = `shapes-${shapes.length}.svg`; a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ---------- UI wiring ----------
+$('pick').onclick = $('empty').onclick = () => $('file').click();
+$('file').onchange = e => { loadFile(e.target.files[0]); e.target.value = ''; };
+$('regen').onclick = regenerate;
+$('stop').onclick = () => { runId++; stopWorkers(); $('stats').textContent += ' · stopped'; };
+$('svg').onclick = downloadSVG;
+$('alpha').oninput = e => $('alphaV').textContent = (+e.target.value).toFixed(2);
+$('res').onchange = () => { if (source) { prepare(); regenerate(); } };
+
+let dragDepth = 0;
+addEventListener('dragenter', e => { e.preventDefault(); dragDepth++; document.body.classList.add('dragging'); });
+addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dragging'); } });
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => {
+  e.preventDefault(); dragDepth = 0; document.body.classList.remove('dragging');
+  loadFile(e.dataTransfer.files[0]);
+});
+addEventListener('paste', e => {
+  const item = [...e.clipboardData.items].find(i => i.type.startsWith('image/'));
+  if (item) loadFile(item.getAsFile());
+});
+</script>
+</body>
+</html>

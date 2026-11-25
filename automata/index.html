@@ -1,0 +1,395 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Cellular Automata</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font: 14px system-ui, sans-serif; display: flex; flex-direction: column; height: 100vh; }
+  #bar { display: flex; gap: 10px; align-items: center; padding: 8px 10px; flex-wrap: wrap; background: #1b1b1b; border-bottom: 1px solid #333; }
+  #wrap { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  canvas { image-rendering: pixelated; cursor: crosshair; }
+  button, select { background: #2a2a2a; color: #ddd; border: 1px solid #444; padding: 4px 10px; border-radius: 4px; cursor: pointer; }
+  button:hover, select:hover { background: #333; }
+  #info { opacity: .6; margin-left: auto; }
+  #main { flex: 1; min-height: 0; display: flex; }
+  #palette { width: 240px; flex-shrink: 0; overflow-y: auto; background: #161616; border-left: 1px solid #333; padding: 8px; box-sizing: border-box; }
+  #palette h4 { margin: 12px 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; opacity: .5; }
+  #palette .items { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+  #palette .item { display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 5px 3px; font-size: 11px; line-height: 1.2; }
+  #palette .item canvas { width: 96px; height: 48px; image-rendering: auto; cursor: pointer; }
+  #palette .item.sel { border-color: #90e050; background: #24301c; }
+  #palette .pencil { width: 100%; }
+  #palette .opt { font-size: 12px; margin-top: 8px; }
+  #palette .opt input[type=range] { width: 100px; vertical-align: middle; }
+  #hint { font-size: 11px; opacity: .6; margin-top: 8px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <select id="mode"></select>
+  <button id="play">Pause</button>
+  <button id="step">Step</button>
+  <button id="rand">Randomize</button>
+  <button id="clear">Clear</button>
+  <label>Speed <input id="speed" type="range" min="1" max="60" value="15"></label>
+  <label>Cell size <input id="size" type="range" min="2" max="16" value="5"></label>
+  <span id="info"></span>
+</div>
+<div id="main">
+  <div id="wrap"><canvas id="c"></canvas></div>
+  <div id="palette">
+    <button class="item pencil sel" id="pencil">Pencil (draw single cells)</button>
+    <div class="opt"><label><input type="checkbox" id="colorize" checked> Color-code patterns</label></div>
+    <div class="opt"><label>Preview opacity <input type="range" id="ghost" min="10" max="100" value="60"></label></div>
+    <div id="hint">Click a pattern, then click the board to stamp it.<br>Q: rotate &middot; F: flip &middot; Esc: back to pencil<br>Right-drag erases &middot; C clears the board</div>
+    <div id="lib"></div>
+  </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const cv = $('c'), ctx = cv.getContext('2d'), wrap = $('wrap');
+
+const rule = arr => { const r = new Uint8Array(9); arr.forEach(i => r[i] = 1); return r; };
+const MODES = [
+  { name: "Conway's Game of Life", type: 'life', B: rule([3]), S: rule([2, 3]) },
+  { name: 'HighLife (B36/S23)', type: 'life', B: rule([3, 6]), S: rule([2, 3]) },
+  { name: 'Seeds (B2/S)', type: 'life', B: rule([2]), S: rule([]), density: 0.03 },
+  { name: 'Day & Night', type: 'life', B: rule([3, 6, 7, 8]), S: rule([3, 4, 6, 7, 8]), density: 0.5 },
+  { name: "Brian's Brain", type: 'brain' },
+  { name: "Brian's Brain (open edges)", type: 'brain', bounded: true },
+  { name: "Langton's Ant (click to add ants)", type: 'ant' },
+  { name: 'Rule 30 (1D)', type: '1d', rule: 30 },
+  { name: 'Rule 110 (1D)', type: '1d', rule: 110 },
+];
+// colors are 0xAABBGGRR
+const PAL = {
+  life:  [0xff1a1a1a, 0xff90e050],
+  brain: [0xff1a1a1a, 0xffffffff, 0xffff6030],
+  ant:   [0xff1a1a1a, 0xff30b0ff],
+  '1d':  [0xff1a1a1a, 0xffe0a0c0],
+};
+
+// [name, RLE, description]
+const LIB = [
+  ['Still lifes', [
+    ['Block', '2o$2o!', 'The simplest still life'],
+    ['Beehive', 'b2o$o2bo$b2o!', 'Common still life'],
+    ['Loaf', 'b2o$o2bo$bobo$2bo!', 'Common still life'],
+    ['Boat', '2o$obo$bo!', 'Common still life'],
+    ['Tub', 'bo$obo$bo!', 'Common still life'],
+    ['Eater', '2o$bo$bobo$2b2o!', 'Destroys gliders that hit it and repairs itself'],
+  ]],
+  ['Oscillators', [
+    ['Blinker', '3o!', 'Period 2'],
+    ['Toad', 'b3o$3o!', 'Period 2'],
+    ['Beacon', '2o$2o$2b2o$2b2o!', 'Period 2'],
+    ['Pulsar', '2b3o3b3o2$o4bobo4bo$o4bobo4bo$o4bobo4bo$2b3o3b3o2$2b3o3b3o$o4bobo4bo$o4bobo4bo$o4bobo4bo2$2b3o3b3o!', 'Period 3'],
+    ['Pentadecathlon', '2bo4bo$2ob4ob2o$2bo4bo!', 'Period 15'],
+  ]],
+  ['Spaceships', [
+    ['Glider', 'bo$2bo$3o!', 'Moves diagonally, 1 cell every 4 generations'],
+    ['LWSS', 'bo2bo$o$o3bo$4o!', 'Lightweight spaceship, moves horizontally'],
+    ['MWSS', '3bo$bo3bo$o$o4bo$5o!', 'Middleweight spaceship'],
+    ['HWSS', '3b2o$bo4bo$o$o5bo$6o!', 'Heavyweight spaceship'],
+  ]],
+  ['Guns', [
+    ['Gosper gun', '24bo$22bobo$12b2o6b2o12b2o$11bo3bo4b2o12b2o$2o8bo5bo3b2o$2o8bo3bob2o4bobo$10bo5bo7bo$11bo3bo$12b2o!', 'Fires a glider every 30 generations'],
+    ['Simkin gun', '2o5b2o$2o5b2o2$4b2o$4b2o5$22b2ob2o$21bo5bo$21bo6bo2b2o$21b3o3bo3b2o$26bo4$20b2o$20bo$21b3o$23bo!', 'Fires a glider every 120 generations'],
+  ]],
+  ['Methuselahs', [
+    ['R-pentomino', 'b2o$2o$bo!', '5 cells, chaos for 1103 generations'],
+    ['Acorn', 'bo$3bo$2o2b3o!', '7 cells, chaos for 5206 generations'],
+    ['Diehard', '6bo$2o$bo3b3o!', 'Vanishes completely after 130 generations'],
+  ]],
+  ['Collisions', [
+    ['Gliders annihilate', 'bo$2bo$3o10$12b3o$12bo$13bo!', 'Two gliders destroy each other completely'],
+    ['Gliders make block', 'bo$2bo$3o9$16b2o$15b2o$17bo!', 'Two gliders crash and leave a block'],
+    ['Gliders make blinker', 'bo$2bo$3o9$8b2o$8bobo$8bo!', 'Two gliders crash and leave a blinker'],
+    ['One glider survives', 'bo$2bo$3o9$6b2o$6bobo$6bo!', 'One glider is destroyed, the other flies on'],
+    ['Glider crash', 'bo$2bo$3o9$12b2o$12bobo$12bo!', 'Two gliders set off a ~400 generation reaction'],
+    ['Gun + eater', '24bo$22bobo$12b2o6b2o12b2o$11bo3bo4b2o12b2o$2o8bo5bo3b2o$2o8bo3bob2o4bobo$10bo5bo7bo$11bo3bo$12b2o16$38b2o$38bobo$40bo$40b2o!', 'An eater swallows every glider the gun fires'],
+    ['Gun duel (cancel)', '24bo31bo$22bobo31bobo$12b2o6b2o12b2o9b2o12b2o6b2o$11bo3bo4b2o12b2o9b2o12b2o4bo3bo$2o8bo5bo3b2o37b2o3bo5bo8b2o$2o8bo3bob2o4bobo31bobo4b2obo3bo8b2o$10bo5bo7bo31bo7bo5bo$11bo3bo49bo3bo$12b2o53b2o!', 'Two glider streams cross and cancel out forever'],
+    ['Gun duel (chaos)', '24bo32bo$22bobo32bobo$12b2o6b2o12b2o10b2o12b2o6b2o$11bo3bo4b2o12b2o10b2o12b2o4bo3bo$2o8bo5bo3b2o38b2o3bo5bo8b2o$2o8bo3bob2o4bobo32bobo4b2obo3bo8b2o$10bo5bo7bo32bo7bo5bo$11bo3bo50bo3bo$12b2o54b2o!', 'Shifted one cell, the streams crash into an expanding mess'],
+  ]],
+];
+
+function parseRLE(rle) {
+  const cells = []; let x = 0, y = 0, num = '';
+  for (const ch of rle) {
+    if (ch >= '0' && ch <= '9') { num += ch; continue; }
+    const k = num ? +num : 1; num = '';
+    if (ch === 'b') x += k;
+    else if (ch === 'o') for (let i = 0; i < k; i++) cells.push([x++, y]);
+    else if (ch === '$') { y += k; x = 0; }
+    else break;
+  }
+  return normalize(cells);
+}
+function normalize(cells) {
+  const mx = Math.min(...cells.map(p => p[0])), my = Math.min(...cells.map(p => p[1]));
+  cells = cells.map(([x, y]) => [x - mx, y - my]);
+  return { cells, w: Math.max(...cells.map(p => p[0])) + 1, h: Math.max(...cells.map(p => p[1])) + 1 };
+}
+
+// color index 0 is plain green (random soup / pencil), 1..N are the library patterns
+function hsl(h, s, l) {
+  const f = k => { const a = s * Math.min(l, 1 - l), t = (k + h / 30) % 12; return Math.round(255 * (l - a * Math.max(-1, Math.min(t - 3, 9 - t, 1)))); };
+  return [f(0), f(8), f(4)];
+}
+const COLORS = [[0x50, 0xe0, 0x90]];
+LIB.flatMap(([, items]) => items).forEach((_, i) => COLORS.push(hsl((i * 137.508 + 20) % 360, 0.85, [0.62, 0.74, 0.5][i % 3])));
+const COLOR32 = COLORS.map(([r, gg, b]) => (0xff000000 | b << 16 | gg << 8 | r) >>> 0);
+const cssColor = i => `rgb(${COLORS[i].join(',')})`;
+
+function blend(a, b, t) {
+  const m = (s) => ((a >> s & 255) * (1 - t) + (b >> s & 255) * t) & 255;
+  return (0xff000000 | m(16) << 16 | m(8) << 8 | m(0)) >>> 0;
+}
+
+let cur = MODES[0], W, H, g, n, col, ncol, img, px, gen = 0, ants = [], row = 0, running = true;
+let brush = null, hover = null;
+
+MODES.forEach((m, i) => $('mode').add(new Option(`${i + 1}. ${m.name}`, i)));
+
+function setup() {
+  const s = +$('size').value;
+  W = Math.floor(wrap.clientWidth / s);
+  H = Math.floor(wrap.clientHeight / s);
+  cv.width = W; cv.height = H;
+  cv.style.width = W * s + 'px'; cv.style.height = H * s + 'px';
+  g = new Uint8Array(W * H); n = new Uint8Array(W * H);
+  col = new Uint8Array(W * H); ncol = new Uint8Array(W * H);
+  img = ctx.createImageData(W, H);
+  px = new Uint32Array(img.data.buffer);
+  randomize();
+}
+
+function clear() {
+  g.fill(0); col.fill(0); gen = 0; ants = []; row = 0;
+  if (cur.type === 'ant') ants.push({ x: W >> 1, y: H >> 1, d: 0 });
+  if (cur.type === '1d') g[W >> 1] = 1;
+}
+
+function randomize() {
+  clear();
+  if (cur.type === 'life' || cur.type === 'brain') {
+    const p = cur.density || (cur.type === 'brain' ? 0.2 : 0.3);
+    for (let i = 0; i < g.length; i++) g[i] = Math.random() < p ? 1 : 0;
+  } else if (cur.type === 'ant') {
+    ants = [];
+    const k = 2 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < k; i++) ants.push({ x: Math.random() * W | 0, y: Math.random() * H | 0, d: Math.random() * 4 | 0 });
+  } else if (cur.type === '1d') {
+    for (let x = 0; x < W; x++) g[x] = Math.random() < 0.5 ? 1 : 0;
+  }
+}
+
+function stepGrid(cellFn) {
+  if (cur.bounded) return stepGridBounded(cellFn);
+  for (let y = 0; y < H; y++) {
+    const ym = ((y - 1 + H) % H) * W, y0 = y * W, yp = ((y + 1) % H) * W;
+    for (let x = 0; x < W; x++) {
+      const xm = (x - 1 + W) % W, xp = (x + 1) % W;
+      // &1 counts only state-1 cells (so Brian's Brain "dying" cells don't count)
+      const c = (g[ym + xm] & 1) + (g[ym + x] & 1) + (g[ym + xp] & 1) + (g[y0 + xm] & 1)
+              + (g[y0 + xp] & 1) + (g[yp + xm] & 1) + (g[yp + x] & 1) + (g[yp + xp] & 1);
+      n[y0 + x] = cellFn(g[y0 + x], c);
+    }
+  }
+  [g, n] = [n, g];
+}
+
+// Everything outside the grid counts as dead, so patterns that leave the screen are gone.
+function stepGridBounded(cellFn) {
+  const on = (x, y) => x < 0 || y < 0 || x >= W || y >= H ? 0 : g[y * W + x] & 1;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const c = on(x - 1, y - 1) + on(x, y - 1) + on(x + 1, y - 1) + on(x - 1, y)
+              + on(x + 1, y) + on(x - 1, y + 1) + on(x, y + 1) + on(x + 1, y + 1);
+      n[y * W + x] = cellFn(g[y * W + x], c);
+    }
+  }
+  [g, n] = [n, g];
+}
+
+// Survivors keep their color; newborn cells take the most common color among their live neighbors.
+function stepLife() {
+  const B = cur.B, S = cur.S, nb = new Int32Array(8), tally = new Uint16Array(COLORS.length);
+  for (let y = 0; y < H; y++) {
+    const ym = ((y - 1 + H) % H) * W, y0 = y * W, yp = ((y + 1) % H) * W;
+    for (let x = 0; x < W; x++) {
+      const xm = (x - 1 + W) % W, xp = (x + 1) % W, i = y0 + x;
+      const c = g[ym + xm] + g[ym + x] + g[ym + xp] + g[y0 + xm] + g[y0 + xp] + g[yp + xm] + g[yp + x] + g[yp + xp];
+      if (g[i]) { n[i] = S[c]; ncol[i] = col[i]; }
+      else if (B[c]) {
+        n[i] = 1;
+        nb[0] = ym + xm; nb[1] = ym + x; nb[2] = ym + xp; nb[3] = y0 + xm;
+        nb[4] = y0 + xp; nb[5] = yp + xm; nb[6] = yp + x; nb[7] = yp + xp;
+        let best = 0, bestN = 0;
+        for (let k = 0; k < 8; k++) if (g[nb[k]]) { const cc = col[nb[k]], t = ++tally[cc]; if (t > bestN) { bestN = t; best = cc; } }
+        for (let k = 0; k < 8; k++) tally[col[nb[k]]] = 0;
+        ncol[i] = best;
+      } else n[i] = 0;
+    }
+  }
+  [g, n] = [n, g]; [col, ncol] = [ncol, col];
+}
+
+const DX = [0, 1, 0, -1], DY = [-1, 0, 1, 0];
+
+function step() {
+  gen++;
+  if (cur.type === 'life') {
+    stepLife();
+  } else if (cur.type === 'brain') {
+    stepGrid((v, c) => v === 1 ? 2 : v === 2 ? 0 : (c === 2 ? 1 : 0));
+  } else if (cur.type === 'ant') {
+    for (const a of ants) {
+      const i = a.y * W + a.x;
+      a.d = g[i] ? (a.d + 3) % 4 : (a.d + 1) % 4; // empty: turn right, filled: turn left
+      g[i] ^= 1;
+      a.x = (a.x + DX[a.d] + W) % W;
+      a.y = (a.y + DY[a.d] + H) % H;
+    }
+  } else if (cur.type === '1d') {
+    let src = row, dst = row + 1;
+    if (row >= H - 1) { g.copyWithin(0, W); src = H - 2; dst = H - 1; } else row++;
+    const s = src * W, d = dst * W, r = cur.rule;
+    for (let x = 0; x < W; x++) {
+      const l = g[s + (x - 1 + W) % W], c = g[s + x], rr = g[s + (x + 1) % W];
+      g[d + x] = (r >> (l << 2 | c << 1 | rr)) & 1;
+    }
+  }
+}
+
+function draw() {
+  const pal = PAL[cur.type];
+  if (cur.type === 'life' && $('colorize').checked) {
+    for (let i = 0; i < px.length; i++) px[i] = g[i] ? COLOR32[col[i]] : pal[0];
+  } else {
+    for (let i = 0; i < px.length; i++) px[i] = pal[g[i]];
+  }
+  if (cur.type === 'ant') for (const a of ants) px[a.y * W + a.x] = 0xff4040ff;
+  if (brush && hover && cur.type === 'life') {
+    const [ox, oy] = brushOrigin(hover), op = +$('ghost').value / 100;
+    const tint = $('colorize').checked ? COLOR32[brush.color] : 0xff60c0ff;
+    for (let y = 0; y < brush.h; y++) for (let x = 0; x < brush.w; x++) {
+      const i = wrapIdx(ox + x, oy + y); px[i] = blend(px[i], 0xffffffff, op * 0.15);
+    }
+    for (const [x, y] of brush.cells) { const i = wrapIdx(ox + x, oy + y); px[i] = blend(px[i], tint, op); }
+  }
+  ctx.putImageData(img, 0, 0);
+  $('info').textContent = `${cur.type === 'ant' ? 'steps' : 'gen'} ${gen.toLocaleString()} · ${running ? 'running' : 'paused'}`;
+}
+
+let acc = 0, last = performance.now();
+function frame(t) {
+  const dt = t - last; last = t;
+  if (running) {
+    const sp = +$('speed').value;
+    if (cur.type === 'ant') {
+      for (let i = 0, k = sp * sp; i < k; i++) step();
+    } else {
+      acc += dt * sp / 1000;
+      let k = 0;
+      while (acc >= 1 && k < 8) { step(); acc--; k++; }
+      if (k === 8) acc = 0;
+    }
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+
+function setMode(i) {
+  cur = MODES[i]; $('mode').value = i;
+  $('palette').style.display = cur.type === 'life' ? '' : 'none';
+  setup();
+}
+function togglePlay() { running = !running; $('play').textContent = running ? 'Pause' : 'Play'; }
+
+$('mode').onchange = e => { setMode(+e.target.value); e.target.blur(); };
+document.addEventListener('pointerup', e => e.target.closest('button')?.blur());
+$('play').onclick = togglePlay;
+$('step').onclick = () => { if (running) togglePlay(); step(); };
+$('rand').onclick = randomize;
+$('clear').onclick = clear;
+$('size').oninput = setup;
+window.onresize = setup;
+
+function cellAt(e) {
+  const r = cv.getBoundingClientRect();
+  const x = Math.floor((e.clientX - r.left) / r.width * W), y = Math.floor((e.clientY - r.top) / r.height * H);
+  return x >= 0 && y >= 0 && x < W && y < H ? [x, y] : null;
+}
+const wrapIdx = (x, y) => ((y % H + H) % H) * W + (x % W + W) % W;
+const brushOrigin = ([cx, cy]) => [cx - (brush.w >> 1), cy - (brush.h >> 1)];
+
+function stamp(p) {
+  const [ox, oy] = brushOrigin(p);
+  for (let y = 0; y < brush.h; y++) for (let x = 0; x < brush.w; x++) g[wrapIdx(ox + x, oy + y)] = 0;
+  for (const [x, y] of brush.cells) { const i = wrapIdx(ox + x, oy + y); g[i] = 1; col[i] = brush.color; }
+}
+function paint([x, y], on) { const i = y * W + x; g[i] = on; col[i] = 0; }
+
+cv.oncontextmenu = e => e.preventDefault();
+cv.onpointerdown = e => {
+  const p = cellAt(e); if (!p) return;
+  if (cur.type === 'ant') ants.push({ x: p[0], y: p[1], d: 0 });
+  else if (brush && cur.type === 'life') stamp(p);
+  else paint(p, e.button === 2 ? 0 : 1);
+};
+cv.onpointermove = e => {
+  hover = cellAt(e);
+  if (!e.buttons || cur.type === 'ant' || (brush && cur.type === 'life') || !hover) return;
+  paint(hover, e.buttons & 2 ? 0 : 1);
+};
+cv.onpointerleave = () => hover = null;
+
+function selectBrush(b, el) {
+  brush = b;
+  document.querySelectorAll('#palette .item').forEach(i => i.classList.toggle('sel', i === el));
+}
+$('pencil').onclick = e => selectBrush(null, e.currentTarget);
+
+const thumbs = [];
+function drawThumb(c, p) {
+  const t = c.getContext('2d'), s = Math.min(92 / p.w, 44 / p.h, 8);
+  const ox = (96 - p.w * s) / 2, oy = (48 - p.h * s) / 2;
+  t.fillStyle = '#1a1a1a'; t.fillRect(0, 0, 96, 48);
+  t.fillStyle = cssColor($('colorize').checked ? p.color : 0);
+  for (const [x, y] of p.cells) t.fillRect(ox + x * s, oy + y * s, Math.max(s - (s > 3), 1), Math.max(s - (s > 3), 1));
+}
+
+let colorIdx = 0;
+for (const [cat, items] of LIB) {
+  const h = document.createElement('h4'); h.textContent = cat; $('lib').append(h);
+  const box = document.createElement('div'); box.className = 'items'; $('lib').append(box);
+  for (const [name, rle, desc] of items) {
+    const p = { ...parseRLE(rle), color: ++colorIdx };
+    const b = document.createElement('button'); b.className = 'item'; b.title = desc;
+    const c = document.createElement('canvas'); c.width = 96; c.height = 48;
+    drawThumb(c, p); thumbs.push([c, p]);
+    b.append(c, name);
+    b.onclick = () => selectBrush(p, b);
+    box.append(b);
+  }
+}
+$('colorize').onchange = () => thumbs.forEach(([c, p]) => drawThumb(c, p));
+
+document.onkeydown = e => {
+  if (e.target.tagName === 'SELECT') return;
+  if (brush && e.key === 'q') brush = { ...normalize(brush.cells.map(([x, y]) => [-y, x])), color: brush.color };
+  else if (brush && e.key === 'f') brush = { ...normalize(brush.cells.map(([x, y]) => [-x, y])), color: brush.color };
+  else if (e.key === 'Escape') selectBrush(null, $('pencil'));
+  else if (e.key === ' ') { e.preventDefault(); togglePlay(); }
+  else if (e.key === 'r') randomize();
+  else if (e.key === 'c') clear();
+  else if (e.key === 's' || e.key === 'ArrowRight') { if (running) togglePlay(); step(); }
+  else if (e.key >= '1' && e.key <= String(MODES.length)) setMode(+e.key - 1);
+};
+
+setup();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
