@@ -5,7 +5,9 @@ Small standalone experiments. Each top-level folder is a static app deployed to 
 | folder | app | domain |
 | --- | --- | --- |
 | `automata/` | cellular automata visualizer | automata.jeffreychen.work |
-| `shape-art/` | geometrizes a photo into triangles | shape-art.jeffreychen.work |
+| `facets/` | geometrizes a photo into triangles | facets.jeffreychen.work |
+
+`facets` is inspired by [Geometrize](https://www.geometrize.co.uk/) by Sam Twidale and [primitive](https://github.com/fogleman/primitive) by Michael Fogleman.
 
 ## Running locally
 

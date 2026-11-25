@@ -13,7 +13,7 @@ jobs:
     strategy:
       matrix:
         # Each folder is its own Cloudflare Pages project with the same name.
-        app: [automata, shape-art]
+        app: [automata, facets]
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
